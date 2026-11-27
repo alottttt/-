@@ -2,7 +2,7 @@
 """原四策略：修正基准（原有因子）与扩展池，同一口径预测下一行情观测日 10Y 变化。
 
 机构因子在样本日收盘后可得；只用此前已成熟的历史标签训练。
-仓位是方向模型输出，不表示按样本日收盘价成交。主流程只生成两张策略表。
+仓位是方向模型输出，不表示按样本日收盘价成交。主流程保存两张运行表并自动生成 JPG。
 """
 import argparse
 import hashlib
@@ -18,7 +18,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from factors import SPECS, FACTOR_ALIASES
+from factors import SPECS, FACTOR_ALIASES, MIGRATION_GROUPS
 
 PROJECT = Path(__file__).resolve().parents[1]
 DATA = PROJECT / "data"
@@ -26,14 +26,14 @@ FACTORS = DATA / "factor_values.parquet"
 MARKET = DATA / "market.parquet"
 OUT_POS = DATA / "strategy_positions.parquet"
 OUT_MET = DATA / "strategy_metrics.parquet"
-STRATEGIES = [("策略1", 120, 5), ("策略2", 180, 5),
-              ("策略3", 120, 7), ("策略4", 60, 7)]
+STRATEGIES = [("策略1", 120, 5), ("策略2", 180, 20),
+              ("策略3", 120, 20), ("策略4", 60, 10)]
 BASE, EXPANDED, LEGACY = "修正基准", "扩展因子池", "旧版Excel参照"
 EXPERIMENTS = (BASE, EXPANDED)
 MIN_PAIRS = 30
 NEAR_CONSTANT_RTOL = 64 * np.finfo(float).eps
 RANK_DECIMALS = 12
-VERSION = "strategy_pool_comparison_v1"
+VERSION = "strategy_pool_comparison_v2_migration"
 KEYS = ["实验", "策略", "日期"]
 
 
@@ -140,6 +140,22 @@ def rolling_statistics(wide, target, window):
     return ic, means, counts, last_pairs
 
 
+def select_candidates(eligible, correlations, names, k):
+    """绝对IC排序；同机构同迁移族仅一票，跳过后继续用后续候选补足K。"""
+    order = np.argsort(-np.round(np.abs(correlations[eligible]), RANK_DECIMALS), kind="stable")
+    selected, seen = [], set()
+    for j in eligible[order]:
+        group = MIGRATION_GROUPS.get(str(names[j]))
+        if group is not None and group in seen:
+            continue
+        selected.append(j)
+        if group is not None:
+            seen.add(group)
+        if len(selected) == k:
+            break
+    return np.asarray(selected, dtype=int)
+
+
 def build_positions(wide, market, baseline, progress=False):
     if not wide.index.equals(market.index) or wide.index.has_duplicates or not wide.index.is_monotonic_increasing:
         raise ValueError("因子、行情必须按共同有序日期一一对齐")
@@ -164,9 +180,7 @@ def build_positions(wide, market, baseline, progress=False):
                 for t, date in enumerate(dates):
                     eligible = pool[np.isfinite(ic[t, pool]) & np.isfinite(x[t, pool])
                                     & np.isfinite(means[t, pool])]
-                    order = np.argsort(-np.round(np.abs(ic[t, eligible]), RANK_DECIMALS),
-                                       kind="stable")
-                    chosen = eligible[order[:k]]
+                    chosen = select_candidates(eligible, ic[t], names, k)
                     votes = -np.sign(ic[t, chosen] * (x[t, chosen] - means[t, chosen])).astype(int)
                     details = [{"因子名": str(names[j]), "IC": float(ic[t, j]),
                                 "有效样本数": int(counts[t, j]), "当日值": float(x[t, j]),
@@ -330,8 +344,13 @@ def validate_results(pos, met):
     for row in new.itertuples(index=False):
         d = row._asdict()
         details = d["入选明细"]
-        if len(details) != d["实际入选数"] or len(details) != min(d["合格因子数"], d["topK"]):
+        if len(details) != d["实际入选数"] or len(details) > min(d["合格因子数"], d["topK"]):
             raise ValueError("入选数量错误")
+        groups = [MIGRATION_GROUPS[item["因子名"]] for item in details if item["因子名"] in MIGRATION_GROUPS]
+        if len(set(groups)) != len(groups):
+            raise ValueError("同一机构同一迁移族重复投票")
+        if not groups and len(details) != min(d["合格因子数"], d["topK"]):
+            raise ValueError("无分组约束时未选足因子")
         if not pd.isna(d["最早执行日期"]) and d["最早执行日期"] <= d["信号可用日期"]:
             raise ValueError("执行日期不晚于收盘后信号")
         if len(details):
@@ -439,6 +458,9 @@ def main(argv=None):
         "target": "100 * (10Y[t+1] - 10Y[t]); prediction only, not executable close-to-close PnL",
         "training": "[t-W,t-1], labels mature no later than t close; mean uses finite historical factor values",
         "ties": f"abs(IC) rounded {RANK_DECIMALS} decimals, factor name ascending, exactly at most K",
+        "migration_groups": {name: list(group) for name, group in MIGRATION_GROUPS.items()},
+        "migration_selection": "at most one factor per institution per migration family; continue ranking to fill K",
+        "migration_formula": "100*(buy share on last 5 detail observation dates - buy share on preceding 20); no overlap",
         "near_constant_rtol": NEAR_CONSTANT_RTOL,
         "pools": {BASE: baseline, EXPANDED: wide.columns.tolist()},
         "baseline_mapping": baseline_mapping(),
@@ -450,6 +472,15 @@ def main(argv=None):
     write_results(pos, met, config)
     print(f"写出逐日结果 {len(pos):,} 行、汇总 {len(met):,} 行；同批次 {config['run_id']}")
     print_comparison(met)
+    try:
+        from strategy_report import write_report
+        output = write_report(pos, met, config, EXPERIMENTS)
+    except Exception as exc:
+        raise RuntimeError(
+            "策略运行记录已保存，但本次 JPG 未更新；现有图片可能属于上次运行。"
+            "排除绘图错误后，可运行 scripts/strategy_report.py 补图。"
+        ) from exc
+    print(f"策略效果 JPG：{output}", flush=True)
     return pos, met
 
 

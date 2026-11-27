@@ -86,7 +86,16 @@ def check_strategy(fv, market, positions, config):
                                    "当日值": current, "历史均值": mean,
                                    "投票": int(-np.sign(ic * (current - mean)))})
             candidates.sort(key=lambda d: (-round(abs(d["IC"]), 12), d["因子名"]))
-            expected = candidates[:int(row["topK"])]
+            expected, used_groups = [], set()
+            for candidate in candidates:
+                group = tuple(config.get("migration_groups", {}).get(candidate["因子名"], []))
+                if group and group in used_groups:
+                    continue
+                expected.append(candidate)
+                if group:
+                    used_groups.add(group)
+                if len(expected) == int(row["topK"]):
+                    break
             saved = row["入选明细"]
             issues += int(len(candidates) != row["合格因子数"])
             if [d["因子名"] for d in expected] != [d["因子名"] for d in saved]:

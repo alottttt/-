@@ -76,6 +76,7 @@ def inspect_factor(name, block, expected, category, calendar):
     eligible = count.ge(30) & (np.arange(len(x)) >= 59)
     constant = eligible & roll.min().eq(roll.max())
     is_ratio = name.startswith("分歧度_") or name.endswith("_净买入占比")
+    is_migration = name.startswith(("期限迁移_", "券种迁移_"))
     is_volume = name.startswith("识别_") and name.rsplit("_", 1)[-1] in {
         "成交量", "买入放量", "卖出放量", "VR放量"}
     finite_rows = values[np.isfinite(values)]
@@ -94,7 +95,8 @@ def inspect_factor(name, block, expected, category, calendar):
         "重复日期数": int(block.loc[duplicate, "日期"].nunique()),
         "重复涉及行数": int(duplicate.sum()),
         "日历外行数": int((block["日期"].notna() & ~block["日期"].isin(calendar)).sum()),
-        "比例越界数": int(finite_rows.abs().gt(1 + ATOL).sum()) if is_ratio else 0,
+        "比例越界数": (int(finite_rows.abs().gt(1 + ATOL).sum()) if is_ratio else
+                       int(finite_rows.abs().gt(100 + ATOL).sum()) if is_migration else 0),
         "负成交或放量数": int(finite_rows.lt(0).sum()) if is_volume else 0,
         "不同取值数": finite.nunique(), "零值占比%": percent(finite.eq(0).sum(), len(finite)),
         "2023起零值率%": percent(common.eq(0).sum(), common.count()),

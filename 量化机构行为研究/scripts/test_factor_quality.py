@@ -23,6 +23,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(PROJECT / "src"))
 # 只读取已声明的机构/券种/期限映射和基础因子规格，不调用生产计算函数。
 from factors import BONDS, TENOR, SPECS, RECOG_BUCKETS, RECOG_FORMS, RECOG_INST_BUCKETS, EXCLUDED_FACTORS
+from factors import MIGRATION_BONDS, MIGRATION_TENORS, migration_specs
 
 
 NET, BUY, SELL = "净买入（亿元）", "买入（亿元）", "卖出（亿元）"
@@ -114,6 +115,38 @@ def build_reference(raw):
                 continue
             refs[name] = computed[form].replace([np.inf, -np.inf], np.nan)
             families[name] = f"识别/{form}"
+    # 独立重算迁移：按完整键读取，每个25日切片直接求和，不调用生产聚合/滚动函数。
+    source = raw.set_index(["机构", "券种", "期限桶标签", "日期"])[BUY]
+    cache = {}
+    for spec in migration_specs():
+        key = (spec["family"], spec["inst"])
+        if key not in cache:
+            if spec["family"] == "期限迁移":
+                mapping = {k: [(b, t) for b in ["国债-新债", "国债-老债"] for t in ts]
+                           for k, ts in MIGRATION_TENORS.items()}
+            else:
+                mapping = {k: [(b, "合计") for b in bs] for k, bs in MIGRATION_BONDS.items()}
+            amounts = []
+            for pairs in mapping.values():
+                parts = []
+                for bond, tenor in pairs:
+                    keys = pd.MultiIndex.from_tuples([(spec["inst"], bond, tenor, t) for t in cal],
+                                                    names=source.index.names)
+                    a = source.reindex(keys).to_numpy(float)
+                    parts.append(np.where(np.isfinite(a) & (a >= 0), a, np.nan))
+                amounts.append(np.sum(parts, axis=0))
+            amounts = np.array(amounts).T
+            result = np.full_like(amounts, np.nan)
+            for end in range(24, len(cal)):
+                window = amounts[end-24:end+1]
+                if not np.isfinite(window).all():
+                    continue
+                before, now = window[:20].sum(axis=0), window[20:].sum(axis=0)
+                if before.sum() > 0 and now.sum() > 0:
+                    result[end] = 100 * (now / now.sum() - before / before.sum())
+            cache[key] = pd.DataFrame(result, index=cal, columns=list(mapping))
+        refs[spec["name"]] = cache[key][spec["bucket"]]
+        families[spec["name"]] = spec["family"]
     return refs, families, cal
 
 
@@ -368,7 +401,7 @@ def main():
     coverage(saved, refs, cal)
     construction_issue = construction_details(raw, saved, cal, market)
     section("6. 结论与检查边界")
-    base = report[~report["因子"].str.startswith("识别_")]
+    base = report[report["类别"].isin(["买债强度", "分券种", "机构分歧度", "买入加速度"])]
     daily_base = base[~base["因子"].str.endswith("_周度")]
     print(f"原始四族日度因子：{int(daily_base['数值通过'].sum())}/{len(daily_base)} 个通过数值复核。")
     print(f"保存表中残留周度因子：{sum(n.endswith('_周度') for n in saved)} 个（应为 0）。")

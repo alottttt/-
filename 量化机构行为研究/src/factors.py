@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-factors.py — 因子层：四族因子，输出 factor_values.parquet（长表：日期/因子名/值）。
+factors.py — 基础、识别及每日迁移因子，输出 factor_values.parquet（日期/因子名/值）。
 
 设计（2026-11-22 与用户定稿）：
   - 一个名单 SPECS = 每个因子的 {名称, 族, 公式参数, Excel 对账位置}；
@@ -128,6 +128,49 @@ for _short, _institution in [("中小行", INST["中小行"]), ("券商", INST["
 ZSCORE_WINDOW, ZSCORE_MIN = 252, 60
 DEVIATION_WINDOW, DEVIATION_MIN = 10, 5
 VOLUME_WINDOW, VOLUME_MIN = 20, 10
+
+# 迁移采用机构明细观测日历；5日当前窗口与其前20日参考窗口严格分开。
+MIGRATION_CURRENT, MIGRATION_REFERENCE = 5, 20
+MIGRATION_INSTITUTIONS = tuple(i for i in RECOG_INST_BUCKETS if i != "货币市场基金")
+MIGRATION_TENORS = {
+    "≦1Y": ["≦1Y"], "1-3Y": ["1-3Y"], "3-5Y": ["3-5Y"],
+    "5-7Y": ["5-7Y"], "7-10Y": ["7-10Y"],
+    "10Y+": ["10-15Y", "15-20Y", "20-30Y", ">30Y"],
+}
+MIGRATION_BONDS = {
+    "地方债": ["地方政府债"], "短融/超短融": ["短期/超短期融资券"],
+    "国债": ["国债-新债", "国债-老债"], "其他": ["其他"],
+    "企业债": ["企业债"], "同业存单": ["同业存单"],
+    "政金债": ["政策性金融债-新债", "政策性金融债-老债"],
+    "中票": ["中期票据"], "ABS": ["资产支持证券"],
+}
+# 2026-11-27：沿用用户零值率>30%撤出要求；仅固定输出名单，不删分母输入。
+# 2023-02-09至2026-11-11：保险ABS 80.13%，货基短端77.55%。
+MIGRATION_EXCLUDED = frozenset({
+    "券种迁移_保险公司_全期限_ABS_买入份额_5D_REF20D",
+    "期限迁移_货币市场基金_国债_≦1Y_买入份额_5D_REF20D",
+})
+
+
+def migration_specs(include_excluded=False):
+    specs = []
+    for family, mapping, institutions in (
+        ("期限迁移", MIGRATION_TENORS, (*MIGRATION_INSTITUTIONS, "货币市场基金")),
+        ("券种迁移", MIGRATION_BONDS, MIGRATION_INSTITUTIONS),
+    ):
+        for inst in institutions:
+            for bucket in mapping:
+                if inst == "货币市场基金" and bucket != "≦1Y":
+                    continue
+                scope = "国债" if family == "期限迁移" else "全期限"
+                name = f"{family}_{inst}_{scope}_{bucket}_买入份额_5D_REF20D"
+                if name in MIGRATION_EXCLUDED and not include_excluded:
+                    continue
+                specs.append(dict(name=name, family=family, inst=inst, bucket=bucket))
+    return specs
+
+
+MIGRATION_GROUPS = {s["name"]: (s["family"], s["inst"]) for s in migration_specs()}
 
 _detail = None
 
@@ -381,10 +424,76 @@ def recognition_signals() -> pd.DataFrame:
     return pd.concat(rows, ignore_index=True)
 
 
+def migration_buy_matrix(raw, institution, family, calendar=None):
+    """完整原始键聚合；漏一行也标为缺失，分母始终保留全部分类。"""
+    cal = (pd.DatetimeIndex(sorted(raw["日期"].unique())) if calendar is None
+           else pd.DatetimeIndex(calendar))
+    if cal.has_duplicates or not cal.is_monotonic_increasing:
+        raise ValueError("迁移日历必须唯一且递增")
+    if family == "期限迁移":
+        groups = {k: [(bond, tenor) for bond in RECOG_BONDS for tenor in tenors]
+                  for k, tenors in MIGRATION_TENORS.items()}
+    elif family == "券种迁移":
+        groups = {k: [(bond, "合计") for bond in bonds]
+                  for k, bonds in MIGRATION_BONDS.items()}
+    else:
+        raise ValueError(f"未知迁移族：{family}")
+    expected = [key for keys in groups.values() for key in keys]
+    block = raw.loc[raw["机构"].eq(institution)].set_index(["日期", "券种", "期限桶标签"])
+    if block.index.has_duplicates:
+        raise ValueError(f"{institution} 明细有重复主键")
+    columns = {}
+    for label, keys in groups.items():
+        parts = []
+        for bond, tenor in keys:
+            index = pd.MultiIndex.from_arrays([cal, [bond] * len(cal), [tenor] * len(cal)],
+                                             names=block.index.names)
+            values = block["买入（亿元）"].reindex(index).to_numpy(dtype=float)
+            parts.append(np.where(np.isfinite(values) & (values >= 0), values, np.nan))
+        columns[label] = np.sum(parts, axis=0)  # 任一原始行缺失即为NaN。
+    if len(set(expected)) != len(expected):
+        raise ValueError("迁移分类重复使用原始键")
+    amounts = pd.DataFrame(columns, index=cal)
+    return amounts.where(np.isfinite(amounts).all(axis=1), axis=0)
+
+
+def migration_values(amounts):
+    """买入份额变化，单位pp；25个完整观测，真实零日可累计，零分母留空。"""
+    values = amounts.astype(float)
+    complete = (np.isfinite(values) & values.ge(0)).all(axis=1)
+    values = values.where(complete, axis=0)
+    current = values.rolling(MIGRATION_CURRENT, min_periods=MIGRATION_CURRENT).sum()
+    reference = values.shift(MIGRATION_CURRENT).rolling(
+        MIGRATION_REFERENCE, min_periods=MIGRATION_REFERENCE).sum()
+    # 原始窗口全零时强制精确0，避免滚动求和残差形成假份额或假非零迁移。
+    current = current.mask(values.rolling(MIGRATION_CURRENT).max().eq(0), 0.0)
+    reference = reference.mask(values.shift(MIGRATION_CURRENT).rolling(MIGRATION_REFERENCE).max().eq(0), 0.0)
+    current_total = current.sum(axis=1, min_count=values.shape[1])
+    reference_total = reference.sum(axis=1, min_count=values.shape[1])
+    current_share = current.div(current_total.where(current_total.gt(0)), axis=0)
+    reference_share = reference.div(reference_total.where(reference_total.gt(0)), axis=0)
+    result = 100 * (current_share - reference_share)
+    return result.where(np.isfinite(result))
+
+
+def migration_signals() -> pd.DataFrame:
+    raw = _load()
+    matrices = {}
+    rows = []
+    for spec in migration_specs():
+        key = (spec["family"], spec["inst"])
+        if key not in matrices:
+            matrices[key] = migration_values(migration_buy_matrix(raw, spec["inst"], spec["family"]))
+        s = matrices[key][spec["bucket"]].dropna()
+        rows.append(pd.DataFrame({"日期": s.index, "因子名": spec["name"], "值": s.to_numpy()}))
+    return pd.concat(rows, ignore_index=True)
+
+
 def main():
     long = compute_all()           # 现有四族
     rec = recognition_signals()    # 识别信号族（阶段A）
-    long = pd.concat([long, rec], ignore_index=True)
+    migration = migration_signals()
+    long = pd.concat([long, rec, migration], ignore_index=True)
     long["日期"] = pd.to_datetime(long["日期"])
     if long[["日期", "因子名"]].isna().any().any() or long.duplicated(["日期", "因子名"]).any():
         raise ValueError("因子主键缺失或重复，未写出结果")
@@ -401,6 +510,7 @@ def main():
         temporary.unlink(missing_ok=True)
     print(f"写出 {OUT}：{len(long):,} 行，{long['因子名'].nunique()} 个因子")
     print(f"  四族 {len(SPECS)} 个 + 识别信号族 {rec['因子名'].nunique()} 个")
+    print(f"  每日迁移 {migration['因子名'].nunique()} 个（买入份额5日减此前20日，单位pp）")
     print("DONE")
     return OUT
 
